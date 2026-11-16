@@ -22,11 +22,13 @@ SAM_DEBUG=1 prints the model input / output shapes.
 
 RESEARCH USE ONLY. Output is not a medical diagnosis.
 """
+import json
+import math
 import os
 import re
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import numpy as np
 import nrrd
@@ -47,6 +49,8 @@ MODEL_NAME = ("MedSAM (custom)" if os.environ.get("MEDSAM_CHECKPOINT")
               else "MedSAM (fine-tuned)" if CHECKPOINT == FINETUNED else "MedSAM")
 DEVICE = os.environ.get("SAM_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 DEBUG = bool(os.environ.get("SAM_DEBUG"))
+PRIOR_FLOOR, TREND_WEIGHT = 12.0, 0.85       # time-left tuning, see default_extent / segment_volume
+HISTORY = os.environ.get("TUMOR_HISTORY") or os.path.join(HERE, "run_history.json")   # what earlier runs looked like
 
 if DEVICE == "cuda" and torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True       # the input is always 1024 x 1024: let cuDNN pick the fastest kernels
@@ -218,6 +222,7 @@ class TumorSegmenter:
         self.last_calls = self.last_reused = self.reused = 0
         self._shown = False
         self._cache = OrderedDict()               # (scan, slice, window, precision) -> embedding on the CPU
+        self._lock = threading.Lock()             # the cache is used by the run thread and the background worker
         self.model = sam_model_registry["vit_b"](checkpoint=checkpoint).to(self.device).eval()
 
     def _timed(self, img, box, half, repeats=2):
@@ -304,21 +309,36 @@ class TumorSegmenter:
         return self.decode(emb, box, H, W)
 
     def _cache_get(self, key):
-        v = self._cache.get(key) if key is not None else None
-        if v is None:
+        if key is None:
             return None
-        self._cache.move_to_end(key)
+        with self._lock:
+            v = self._cache.get(key)
+            if v is None:
+                return None
+            self._cache.move_to_end(key)
         return v.to(self.device).float()
 
-    def _cache_put(self, key, emb, limit=120):         # 120 slices = about 240 MB of RAM
+    def _cache_put(self, key, emb, limit=300):         # 300 slices = about 600 MB of RAM
         if key is None:
             return
-        self._cache[key] = emb.half().cpu()
-        while len(self._cache) > limit:
-            self._cache.popitem(last=False)
+        v = emb.half().cpu()
+        with self._lock:
+            self._cache[key] = v
+            while len(self._cache) > limit:
+                self._cache.popitem(last=False)
+
+    def prefetch_slice(self, vol, k, center, width, cache_key):
+        """Run the slow image encoder for slice k now and remember it, so a later run is instant for it."""
+        key = (cache_key, k, round(float(center), 3), round(float(width), 3), self.half)
+        with self._lock:
+            if key in self._cache:
+                return False
+        self._cache_put(key, self.embed(slice_to_uint8(axial(vol, k), center, width))[0])
+        return True
 
     def segment_volume(self, vol, k0, box, center=None, width=None, follow=True, step=1, spacing=None,
-                       max_slices=60, min_area=20, growth_limit=3.0, agree=0.92, coarse=4, cache_key=None, progress=None):
+                       max_slices=60, min_area=20, growth_limit=3.0, agree=0.92, coarse=4, cache_key=None,
+                       progress=None):
         """Segment slice k0 from a box, then (optionally) follow the tumor up and down the stack.
 
         The model only ever sees one 2D slice at a time; this loop repeats it slice by slice.
@@ -326,45 +346,85 @@ class TumorSegmenter:
         step=0  Smart: a coarse pass over every 4th slice, then the model is run on a slice in
                 between only where the shape is changing (so accuracy stays close to Best).
         Each new slice is prompted with the previous mask's bounding box; following stops when the
-        mask vanishes or jumps in size. progress(done, expected) is called after every model run.
+        mask vanishes or jumps in size.
+        progress(done, expected, seconds, reused) is called after every model run, and once more with
+        seconds = -1 when only the tidy-up is left. `expected` is the best guess of the final number
+        of runs: earlier runs tell how far a tumor usually reaches, and once one direction has finished
+        the other is expected to be about as long.
         Returns a boolean mask volume shaped like `vol`.
         """
         nz = vol.shape[2]
         smart = int(step) == 0 and ndi is not None
         s = coarse if smart else (2 if int(step) == 0 else max(int(step), 1))
-        expected = [estimate_calls(box, spacing, s, smart, follow, max_slices)]
-        calls = [0]
+        prior_reach = max(min(typical_extent() or default_extent(box, spacing), max_slices), 2.0)
+        st = {"phase": "sweep", "d": 1, "cur": 0, "z": 0, "areas": [], "first_reach": 0, "gaps_left": 0}
+        calls, miss, a0 = [0], [0.0, 0], [0]
         self.reused = 0
+
+        def reach_now(prior):
+            """How many slices the tumor reaches in this direction: the prior, blended more and more with
+            an extrapolation of how quickly the area has been shrinking (a tumor tapers like an ellipsoid)."""
+            pts = st["areas"][-3:]
+            if len(pts) < 2 or a0[0] <= 0:
+                return prior
+            ests = [z / math.sqrt(1 - min(max(a / a0[0], 0.02), 0.97)) for z, a in pts]
+            trend = sorted(ests)[len(ests) // 2]
+            w = min(pts[-1][0] / 12.0, 1.0) * TREND_WEIGHT
+            return min((1 - w) * prior + w * trend, max_slices)
+
+        def expected():
+            if not follow:
+                return 1
+            if st["phase"] == "sweep":
+                if st["d"] == 1:                          # nothing finished yet: lean on what earlier runs looked like
+                    reach = reach_now(prior_reach)
+                    other = reach / s
+                else:                                     # the second direction is usually about as long as the first
+                    reach = reach_now(st["first_reach"] or prior_reach)
+                    other = 0.0
+                rem = max((reach - st["z"]) / s, 1.0) + other + (s - 1)
+                if smart:                                 # the look-closer pass costs about as much as the coarse pass
+                    rem += 0.9 * (calls[0] + rem)
+                return calls[0] + max(int(round(rem)), 1)
+            return calls[0] + int(round(st["gaps_left"] * 1.3))
 
         def run(k, bbox):
             key = None if cache_key is None else (cache_key, k, round(float(center), 3), round(float(width), 3), self.half)
+            t0, r0 = time.perf_counter(), self.reused
             m = self.segment_slice(slice_to_uint8(axial(vol, k), center, width), bbox, key)
+            dt, hit = time.perf_counter() - t0, self.reused > r0
             calls[0] += 1
-            if calls[0] >= 0.85 * expected[0]:               # the estimate was low: stretch it
-                expected[0] = int(calls[0] * 1.3) + 2
+            if not hit:
+                miss[0] += dt
+                miss[1] += 1
             if progress:
-                progress(calls[0], expected[0])
+                progress(calls[0], expected(), dt, hit)
             return m
 
         def next_slice(prev, k, pad):
             bbox = mask_bbox(prev, pad=pad)
             if bbox is None:
                 return None
+            st["cur"] += 1
             m = run(k, bbox)
             if m.sum() < min_area or m.sum() > growth_limit * max(prev.sum(), 1):
                 return None
             return m
 
         first = run(k0, box)
+        a0[0] = int(first.sum())
         computed = {k0: first}
         if follow:
             for d in (1, -1):
+                st["d"], st["cur"], st["z"], st["areas"] = d, 0, 0, []
                 prev, last, k = first, k0, k0 + d * s
                 while 0 <= k < nz and abs(k - k0) <= max_slices:
                     m = next_slice(prev, k, 4 + 2 * (s - 1))
                     if m is None:
                         break
                     computed[k] = m
+                    st["z"] = abs(k - k0)
+                    st["areas"].append((st["z"], int(m.sum())))
                     prev, last, k = m, k, k + d * s
                 for j in range(1, s):                    # the tumor may end between two sampled slices
                     kk = last + d * j
@@ -374,7 +434,10 @@ class TumorSegmenter:
                     if m is None:
                         break
                     computed[kk] = m
+                    st["z"] = abs(kk - k0)
                     prev, last = m, kk
+                if d == 1:
+                    st["first_reach"] = st["z"]
 
             if smart:                                    # look closer only where the shape is changing
                 sdfs = {}
@@ -398,30 +461,120 @@ class TumorSegmenter:
                         refine(km, kb)
 
                 ks = sorted(computed)
-                for ka, kb in zip(ks[:-1], ks[1:]):
+                gaps = [(a, b) for a, b in zip(ks[:-1], ks[1:]) if b - a > 1]
+                st["phase"], st["gaps_left"] = "refine", len(gaps)
+                for ka, kb in gaps:
                     refine(ka, kb)
+                    st["gaps_left"] -= 1
 
+        if progress:
+            progress(calls[0], calls[0], -1.0, True)     # every model run is done, only the tidy-up is left
         mask3d = np.zeros(vol.shape, dtype=bool)
         for k, m in computed.items():
             mask3d[:, :, k] = m.T
         if s > 1:
             fill_between(mask3d, computed)
         self.last_calls, self.last_reused = calls[0], self.reused
+        if follow and calls[0] >= 3:                     # remember how far this tumor reached and how long a run took
+            reach = [e for e in (max(computed) - k0, k0 - min(computed)) if e > 0]
+            _remember(extent=sum(reach) / len(reach) if reach else None,
+                      miss_s=miss[0] / miss[1] if miss[1] >= 3 else None)
         return clean_mask(mask3d, k0) if follow else mask3d
 
 
-def estimate_calls(box, spacing, step, smart, follow, max_slices):
-    """Rough number of model runs, used only for the percentage and the time left."""
-    if not follow:
-        return 1
-    if spacing:                                          # a tumor is about as deep as it is wide
+def default_extent(box, spacing):
+    """First guess, before any earlier run is known: how many slices a tumor reaches in each direction.
+    A tumor is taken to be about as deep as it is wide, and never less than 12 slices. This only matters for
+    the very first run: after that the app remembers how far earlier tumors reached."""
+    if spacing:
         diam = max((box[2] - box[0]) * spacing[0], (box[3] - box[1]) * spacing[1])
-        span = max(diam / max(spacing[2], 1e-6), 3.0)
-    else:
-        span = 20.0
-    span = min(span, 2 * max_slices + 1)
-    est = span / 4 * 1.8 + 2 if smart else span / step + step
-    return int(max(est, 3))
+        return max(diam / max(spacing[2], 1e-6) / 2, PRIOR_FLOOR)
+    return PRIOR_FLOOR
+
+
+def _history():
+    try:
+        with open(HISTORY) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _remember(extent=None, miss_s=None):
+    h = _history()
+    for name, v in (("extents", extent), ("miss_s", miss_s)):
+        if v is not None:
+            h[name] = (h.get(name, []) + [round(float(v), 3)])[-10:]
+    try:
+        with open(HISTORY, "w") as f:
+            json.dump(h, f)
+    except OSError:
+        pass
+
+
+def typical_extent():
+    """Median of how far (in slices, per direction) recent tumors reached, or None."""
+    v = _history().get("extents", [])
+    return float(np.median(v)) if v else None
+
+
+def typical_miss_seconds():
+    """Median time of a model run that had to do the slow image step; 0.8 s until it has been measured."""
+    v = _history().get("miss_s", [])
+    return float(np.median(v)) if v else 0.8
+
+
+class EtaEstimator:
+    """Time left, worked out the way a browser does for a download: a smoothed speed from the last
+    runs, times the work still to do, corrected gently at every update (so it does not jump around),
+    and counted down between updates. The work still to do is only a guess, because the model decides
+    where the tumor ends; segment_volume refines that guess as it goes."""
+
+    def __init__(self):
+        self.win = deque(maxlen=10)              # (seconds, reused) of the last model runs
+        self.miss0 = typical_miss_seconds()
+        self.t_start = self.t_update = self.shown = None
+        self.finishing = False
+
+    def per_run(self):
+        misses = [d for d, h in self.win if not h]
+        hits = [d for d, h in self.win if h]
+        if len(misses) >= 3:
+            miss = sum(misses) / len(misses)
+        elif misses:                             # too few samples yet: lean on what earlier runs took
+            miss = (sum(misses) + self.miss0 * (3 - len(misses))) / 3
+        else:
+            miss = self.miss0
+        hit = sum(hits) / len(hits) if hits else 0.05
+        p = 0.9 * len(hits) / max(len(self.win), 1)           # chance that the next slice is already prepared
+        return p * hit + (1 - p) * miss
+
+    def update(self, done, expected, dt, hit, now):
+        if dt < 0:
+            self.finishing = True
+            return
+        if self.t_start is None:
+            self.t_start = now - max(dt, 0.0)
+        self.win.append((dt, hit))
+        target = max(expected - done, 0) * self.per_run()
+        if self.shown is None:
+            self.shown = target
+        else:
+            counted = max(self.shown - (now - self.t_update), 0.0)
+            self.shown = 0.6 * counted + 0.4 * target
+        self.t_update = now
+
+    def remaining(self, now):
+        if self.shown is None:
+            return None
+        return max(self.shown - (now - self.t_update), 0.0)
+
+    def fraction(self, now):
+        left = self.remaining(now)
+        if left is None or self.t_start is None:
+            return 0.0
+        el = max(now - self.t_start, 1e-6)
+        return min(el / (el + left), 0.99)
 
 
 # One shared model: loaded (and warmed up) once, in the background if possible.
@@ -448,7 +601,8 @@ def precision():
 
 def clear_cache():
     if _SEG is not None:
-        _SEG._cache.clear()
+        with _SEG._lock:
+            _SEG._cache.clear()
 
 
 # --------------------------------------------------------- mask utilities
