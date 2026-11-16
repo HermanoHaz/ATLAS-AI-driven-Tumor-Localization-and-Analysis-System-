@@ -1,78 +1,136 @@
-"""theme.py - colours and the Qt stylesheet shared by the login window and the viewer."""
-from string import Template
+"""
+ATLAS - shared theme helpers  (theme/theme.py)
 
-BG, SURF, RAISED, LINE = "#0a0e13", "#141a22", "#1c242e", "#243040"
-VIEW = "#06080c"
-TEXT, MUTED, FAINT = "#e8eef4", "#8a99a9", "#5b6876"
-ACCENT, ACCENT_HI, ACCENT_INK = "#4f8cff", "#7aaaff", "#06142e"
-DANGER, OK, WARN = "#ff6b6b", "#3ddc84", "#f5c542"
-TRACK = "#2a3441"
-PLANE = {0: "#f5c542", 1: "#3ddc84", 2: "#ff5d5d"}       # sagittal, coronal, axial
-PRED = "#ff4081"                                         # tumor predicted by MedSAM
-PRED_RGB = (255, 64, 129)
-GT = "#00f0ff"                                           # actual (ground-truth) tumor
-GT_RGB = (0, 240, 255)
+Colours, fonts and small helpers used by the shared header / footer
+(components/header.py, components/footer.py).
 
-_QSS = Template("""
-* { font-family: "Segoe UI Variable Text", "Segoe UI", "Inter", "Helvetica Neue", sans-serif; font-size: 13px; }
-QWidget { background: $BG; color: $TEXT; }
-QLabel { background: transparent; }
-QLabel#muted { color: $MUTED; }
-QLabel#title { font-size: 15px; font-weight: 700; }
-QLabel#cardTitle { font-size: 13px; font-weight: 700; }
-QLabel#hero { font-size: 22px; font-weight: 700; }
-QLabel#error { color: $DANGER; }
-QLabel#hint { color: $MUTED; font-size: 12px; }
-QLabel#pill { background: #202a36; color: $MUTED; border-radius: 9px; padding: 2px 9px;
-              font-size: 11px; font-weight: 600; }
+CINEMATIC TITLE FONT
+    1. Download "Orbitron" from fonts.google.com/specimen/Orbitron
+    2. Copy the .ttf file(s) into  assets/fonts/   (create the folder)
+    3. Restart the app - it loads every .ttf / .otf in that folder automatically.
+    (Without the file, it falls back to Bahnschrift / Segoe UI.)
+"""
+import glob
+import os
 
-QFrame#topbar { background: #0d1218; border-bottom: 1px solid #1c2530; }
-QFrame#statusbar { background: #0d1218; border-top: 1px solid #1c2530; }
-QFrame#card { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #18202a, stop:1 #131a22);
-              border: 1px solid $LINE; border-radius: 14px; }
-QFrame#viewport { background: $VIEW; border: 1px solid $LINE; border-radius: 14px; }
-QSplitter::handle { background: transparent; }
+from PySide6.QtCore import Qt, QPointF
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QRadialGradient
+from PySide6.QtWidgets import QFrame, QLabel, QWidget
 
-QPushButton { background: $RAISED; color: $TEXT; border: 1px solid transparent; border-radius: 10px;
-              padding: 9px 14px; font-weight: 600; }
-QPushButton:hover { background: #2a3441; }
-QPushButton:focus { border: 1px solid $ACCENT; }
-QPushButton:disabled { background: #161d26; color: $FAINT; }
-QPushButton#primary { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #6ea5ff, stop:1 #4a82f5);
-                      color: $ACCENT_INK; }
-QPushButton#primary:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #86b4ff, stop:1 #5b91ff); }
-QPushButton#primary:disabled { background: #1c2838; color: $FAINT; }
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR = os.path.join(ROOT_DIR, "assets")
+FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
 
-QFrame#seg { background: #0e141b; border: 1px solid $LINE; border-radius: 11px; }
-QFrame#seg QPushButton { background: transparent; color: $MUTED; border: none; border-radius: 8px; padding: 6px 14px; }
-QFrame#seg QPushButton:hover { color: $TEXT; }
-QFrame#seg QPushButton:focus { border: none; }
-QFrame#seg QPushButton:checked { background: #2a3544; color: $TEXT; }
-QFrame#seg[accent="true"] QPushButton:checked { background: $ACCENT; color: $ACCENT_INK; }
+# ----------------------------------------------------------------------------
+# Main theme (same values as the screens)
+# ----------------------------------------------------------------------------
+CYAN = QColor("#3fd0e2")
+PURPLE_LIGHT = "#a98bff"
+GREEN = "#3de0a0"
 
-QSlider { background: transparent; }
-QSlider::groove:horizontal { height: 5px; background: $TRACK; border-radius: 2px; }
-QSlider::sub-page:horizontal { background: $ACCENT; border-radius: 2px; }
-QSlider::handle:horizontal { background: #ffffff; width: 14px; height: 14px; margin: -5px 0;
-                             border-radius: 7px; border: 2px solid $ACCENT; }
-QSlider::handle:horizontal:hover { width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }
+# ----------------------------------------------------------------------------
+# SHELL colours - header & footer use a navy / steel-blue band so users can
+# tell them apart from the near-black page content.  Change them here.
+# ----------------------------------------------------------------------------
+SHELL_BG_TOP = "#14223a"
+SHELL_BG_BOTTOM = "#0d1829"
+SHELL_BORDER = "#25416b"
+SHELL_ACCENT = "#4cc3ff"
+SHELL_TEXT = "#e6f0fb"
+SHELL_TEXT_DIM = "#8196b0"
+SHELL_TEXT_FAINT = "#5d7391"
 
-QProgressBar { background: $TRACK; border: none; border-radius: 2px; max-height: 4px; min-height: 4px; }
-QProgressBar::chunk { background: $ACCENT; border-radius: 2px; }
+# ----------------------------------------------------------------------------
+# Fonts
+# ----------------------------------------------------------------------------
+SANS = ["Inter", "Segoe UI", "Helvetica Neue", "Arial"]
+MONO = ["JetBrains Mono", "Consolas", "Menlo", "Courier New"]
+TITLE_FONT = ["Orbitron", "Michroma", "Audiowide", "Bahnschrift", "Segoe UI", "Arial"]
 
-QLineEdit { background: $RAISED; color: $TEXT; border: 1px solid $LINE; border-radius: 10px; padding: 10px 12px;
-            selection-background-color: $ACCENT; }
-QLineEdit:focus { border: 1px solid $ACCENT; }
+_fonts_loaded = False
 
-QScrollArea { border: none; background: transparent; }
-QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
-QScrollBar::handle:vertical { background: #2a3441; border-radius: 4px; min-height: 30px; }
-QScrollBar::handle:vertical:hover { background: #3a4757; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QToolTip { background: $RAISED; color: $TEXT; border: 1px solid $LINE; padding: 4px 8px; }
-QMessageBox, QFileDialog, QDialog { background: $BG; }
-""")
 
-QSS = _QSS.substitute(BG=BG, SURF=SURF, RAISED=RAISED, LINE=LINE, VIEW=VIEW, TEXT=TEXT, MUTED=MUTED,
-                      FAINT=FAINT, ACCENT=ACCENT, ACCENT_HI=ACCENT_HI, ACCENT_INK=ACCENT_INK,
-                      DANGER=DANGER, TRACK=TRACK)
+def load_custom_fonts():
+    """Register every .ttf / .otf found in assets/fonts (runs once)."""
+    global _fonts_loaded
+    if _fonts_loaded:
+        return
+    _fonts_loaded = True
+    for pattern in ("*.ttf", "*.otf", "*.TTF", "*.OTF"):
+        for path in glob.glob(os.path.join(FONTS_DIR, pattern)):
+            QFontDatabase.addApplicationFont(path)
+
+
+def make_font(families, px, weight=QFont.Normal, spacing=0.0):
+    f = QFont()
+    f.setFamilies(families)
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    if spacing:
+        f.setLetterSpacing(QFont.AbsoluteSpacing, spacing)
+    return f
+
+
+def make_label(text, families, px, color, weight=QFont.Normal, spacing=0.0,
+               align=Qt.AlignLeft):
+    lbl = QLabel(text)
+    lbl.setFont(make_font(families, px, weight, spacing))
+    lbl.setStyleSheet(f"color: {color}; background: transparent;")
+    lbl.setAlignment(align | Qt.AlignVCenter)
+    return lbl
+
+
+def vline(height, color=SHELL_BORDER):
+    f = QFrame()
+    f.setFixedSize(1, height)
+    f.setStyleSheet(f"background: {color};")
+    return f
+
+
+# ----------------------------------------------------------------------------
+# Logo lookup (assets/ folder, matches the START of the file name)
+# ----------------------------------------------------------------------------
+def find_logo(name: str):
+    folders = [ASSETS_DIR, os.path.join(os.getcwd(), "assets")]
+    for folder in folders:
+        matches = glob.glob(os.path.join(folder, name + "*"))
+        matches = [m for m in matches if m.lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp", ".bmp"))]
+        if matches:
+            return matches[0]
+    print(f"[theme] Logo '{name}' not found. Looked in:")
+    for f in folders:
+        print("   ", os.path.abspath(f))
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Glowing status dot
+# ----------------------------------------------------------------------------
+class Dot(QWidget):
+    def __init__(self, color, size=6, parent=None):
+        super().__init__(parent)
+        self.color = QColor(color)
+        self.size = size
+        self.setFixedSize(size + 8, size + 8)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+
+    def set_color(self, color):
+        self.color = QColor(color)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        c = QPointF(self.width() / 2, self.height() / 2)
+        g = QRadialGradient(c, self.width() / 2)
+        c0 = QColor(self.color); c0.setAlpha(90)
+        c1 = QColor(self.color); c1.setAlpha(0)
+        g.setColorAt(0, c0)
+        g.setColorAt(1, c1)
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawEllipse(c, self.width() / 2, self.width() / 2)
+        p.setBrush(self.color)
+        p.drawEllipse(c, self.size / 2, self.size / 2)
+        p.end()
